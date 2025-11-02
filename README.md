@@ -136,6 +136,7 @@ These files support presentation of generalization quality and comparison across
 
 ## 8) Repository structure (key files)
 
+```
 /app
 ├── create_model_cv.py - Baseline pipeline + 5-fold CV + versioning/artifacts
 ├── create_model_xgb.py - Optuna tuning + CV on best params + final retrain + artifacts
@@ -157,3 +158,4 @@ These files support presentation of generalization quality and comparison across
             ├── xgb_final_<timestamp>.pkl
             ├── model_features_<timestamp>.json
             └── report_<timestamp>.json
+```
