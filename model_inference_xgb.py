@@ -7,7 +7,8 @@ import time
 import pickle
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Any, Optional
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,18 @@ class PredictBatchResponse(BaseModel):
     predictions: List[float]
     metadata: dict
 
+class EvalItem(BasicHouseFeatures):
+    price: float
+
+class EvaluateRequest(BaseModel):
+    items: List[EvalItem]
+
+class EvaluateResponse(BaseModel):
+    predictions: List[float]
+    y_true: List[float]
+    metrics: dict
+    per_item: List[dict]
+    metadata: dict
 
 # --------------- App & Lifespan ---------------
 app = FastAPI(title="House Price Inference API (XGB + Optuna)", version="1.0.0")
@@ -149,6 +162,21 @@ def _align_columns(X: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
             X[c] = 0.0
     return X[expected_cols]
 
+def _mape_pct(y_true, y_pred) -> Optional[float]:
+    """Mean Absolute Percentage Error in percent. Skips near-zero truths."""
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    mask = np.abs(yt) > 1e-9
+    if not np.any(mask):
+        return None
+    return float(np.mean(np.abs((yt[mask] - yp[mask]) / yt[mask])) * 100.0)
+
+def _compute_metrics(y_true, y_pred):
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if len(y_true) >= 2 else None
+    mape = _mape_pct(y_true, y_pred)
+    return {"rmse": rmse, "mae": mae, "mape_pct": mape, "r2": r2, "n_items": len(y_true)}
 
 # --------------- Routes ---------------
 @app.get("/health_check")
@@ -217,6 +245,63 @@ def predict_batch(req: PredictBatchRequest):
     latency_ms = int((time.time() - t0) * 1000)
     return PredictBatchResponse(
         predictions=preds,
+        metadata={
+            "n_inputs": len(preds),
+            "model_stamp": stamp,
+            "model_path": model_path,
+            "features_path": feats_path,
+            "latency_ms": latency_ms,
+            "demographics_source": str(DEMOGRAPHICS_CSV),
+        },
+    )
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+def evaluate(req: EvaluateRequest):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided.")
+
+    # Load current artifacts
+    model, expected, stamp, model_path, feats_path = _load_bundle(ARTIFACTS_DIR)
+
+    # Build dataframe from request
+    base = pd.DataFrame([it.model_dump() for it in req.items])
+    y_true = base.pop("price").astype(float).tolist()
+
+    # Merge demographics, engineer features, align columns
+    merged = _merge_demographics(base)
+    engineered = add_features(merged)
+    X = _align_columns(engineered, expected)
+
+    # Predict (to price space)
+    t0 = time.time()
+    try:
+        preds = model.predict(X)
+        preds = np.expm1(preds) if LOG_TARGET else preds
+        preds = [float(x) for x in preds]
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Inference failed during evaluation: {e}")
+    latency_ms = int((time.time() - t0) * 1000)
+
+    # Metrics
+    metrics = _compute_metrics(y_true, preds)
+
+    # Per-item details (incl. % error when safe)
+    per_item = []
+    for i, (yt, yp) in enumerate(zip(y_true, preds)):
+        ape = (abs(yt - yp) / yt * 100.0) if abs(yt) > 1e-9 else None
+        per_item.append({
+            "index": i,
+            "y_true": float(yt),
+            "y_pred": float(yp),
+            "abs_error": float(abs(yt - yp)),
+            "abs_pct_error": float(ape) if ape is not None else None
+        })
+
+    return EvaluateResponse(
+        predictions=preds,
+        y_true=[float(v) for v in y_true],
+        metrics=metrics,
+        per_item=per_item,
         metadata={
             "n_inputs": len(preds),
             "model_stamp": stamp,

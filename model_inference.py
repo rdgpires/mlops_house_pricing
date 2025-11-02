@@ -136,11 +136,24 @@ def _prepare_frame(items: List[HouseFeatures], expected_features: List[str]) -> 
     df = df[expected_features]  # order & drop extras columns
     return df, missing
 
+def _mape_pct(y_true, y_pred) -> Optional[float]:
+    """
+    Mean Absolute Percentage Error in percent.
+    Ignores rows where y_true is 0 (or extremely close) to avoid division blow-ups.
+    """
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    mask = np.abs(yt) > 1e-9
+    if not np.any(mask):
+        return None
+    return float(np.mean(np.abs((yt[mask] - yp[mask]) / yt[mask])) * 100.0)
+
 def _compute_metrics(y_true, y_pred_list):
     mae = float(mean_absolute_error(y_true, y_pred_list))
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred_list)))  # sqrt(MSE)
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred_list)))
     r2 = float(r2_score(y_true, y_pred_list)) if len(y_true) >= 2 else None
-    return {"rmse": rmse, "mae": mae, "r2": r2, "n_items": len(y_true)}
+    mape = _mape_pct(y_true, y_pred_list)
+    return {"rmse": rmse, "mae": mae, "mape_pct": mape, "r2": r2, "n_items": len(y_true)}
 
 # --- Routes ---
 @app.get("/health_check")
@@ -235,7 +248,7 @@ def predict_basic(req: PredictBasicRequest):
 def evaluate_basic(req: EvaluateBasicRequest) -> Dict[str, Any]:
     """
     Accepts items with only the variables used in training (BasicHouseFeatures) + 'price'.
-    Returns per-item predictions and aggregate RMSE/MAE/R2.
+    Returns per-item predictions and aggregate RMSE/MAE/MAPE/R2.
     """
     if not req.items:
         raise HTTPException(status_code=400, detail="No items provided.")
@@ -243,7 +256,7 @@ def evaluate_basic(req: EvaluateBasicRequest) -> Dict[str, Any]:
     # Load model bundle
     model, expected_features, version, model_path, features_path = _load_latest_bundle()
 
-    # Separate y_true and features (basic schema + price)
+    # y_true + features
     y_true = [float(it.price) for it in req.items]
     df = pd.DataFrame([{
         "bedrooms": it.bedrooms,
@@ -256,7 +269,7 @@ def evaluate_basic(req: EvaluateBasicRequest) -> Dict[str, Any]:
         "zipcode": str(it.zipcode),
     } for it in req.items])
 
-    # Merge demographics & align features expected by the model (como no /predict_basic)
+    # Merge demographics & align features (same as /predict_basic)
     demo = app.state.demographics
     df = df.merge(demo, how="left", on="zipcode").drop(columns="zipcode")
 
@@ -277,19 +290,22 @@ def evaluate_basic(req: EvaluateBasicRequest) -> Dict[str, Any]:
 
     per_item = []
     for i, (yt, yp) in enumerate(zip(y_true, y_pred_list)):
+        # Safe percentage error (None if yt ~ 0)
+        pct_err = (abs(yt - yp) / yt * 100.0) if abs(yt) > 1e-9 else None
         per_item.append({
             "index": i,
             "y_true": yt,
             "y_pred": yp,
             "abs_error": float(abs(yt - yp)),
             "squared_error": float((yt - yp) ** 2),
+            "abs_pct_error": float(pct_err) if pct_err is not None else None
         })
 
     return {
         "predictions": y_pred_list,
         "y_true": [float(v) for v in y_true],
         "per_item": per_item,
-        "metrics": metrics_dict,
+        "metrics": metrics_dict,   # includes mape_pct
         "metadata": {
             "n_inputs": len(req.items),
             "required_features_only": True,
