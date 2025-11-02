@@ -119,23 +119,137 @@ def _load_bundle(art_dir: Path, stamp: str | None = None) -> tuple[object, list[
 
 
 # --------------- Feature Engineering (same as training) ---------------
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+
+
+def _safe_log1p(s: pd.Series) -> pd.Series:
+    # evita negativos/NaN; funciona mesmo com valores faltantes
+    return np.log1p(s.clip(lower=0).fillna(0.0))
+
+
+def _as_fraction(s: pd.Series) -> pd.Series:
+    """Converte percentuais em frações 0–1; assume que valores podem estar em 0–100 ou 0–1; faz clamp."""
+    s = s.astype(float)
+    # heurística: se a mediana > 1.5, provavelmente está em porcentagem 0–100
+    median = s.replace([np.inf, -np.inf], np.nan).dropna().median() if len(s) else 0
+    if pd.notna(median) and median > 1.5:
+        s = s / 100.0
+    return s.clip(lower=0.0, upper=1.0).fillna(0.0)
+
+
+def _entropy_from_parts(parts: pd.DataFrame) -> pd.Series:
+    """Entropia normalizada (0–1) de distribuição de escolaridade."""
+    vals = parts.fillna(0.0).astype(float)
+    total = vals.sum(axis=1)
+    # evita divisão por zero
+    frac = vals.div(total.replace(0, np.nan), axis=0).fillna(0.0)
+    # entropia de Shannon
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ent = -(frac * np.log(frac.where(frac > 0, 1.0))).sum(axis=1)
+    # normaliza por log(k) com k = número de categorias
+    k = vals.shape[1] if vals.shape[1] > 0 else 1
+    ent_norm = ent / np.log(k)
+    return ent_norm.clip(lower=0.0, upper=1.0).fillna(0.0)
+
+def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature engineering para variáveis demográficas do arquivo anexado.
+    Opera defensivamente: só cria o que existir nas colunas.
+    """
     out = df.copy()
+
+    # Nomes esperados (do CSV anexado)
+    qty_cols = [
+        "ppltn_qty", "urbn_ppltn_qty", "sbrbn_ppltn_qty", "farm_ppltn_qty",
+        "non_farm_qty",
+        "edctn_less_than_9_qty", "edctn_9_12_qty", "edctn_high_schl_qty",
+        "edctn_some_clg_qty", "edctn_assoc_dgre_qty",
+        "edctn_bchlr_dgre_qty", "edctn_prfsnl_qty",
+    ]
+    per_cols = [
+        "per_urbn", "per_sbrbn", "per_farm", "per_non_farm",
+        "per_less_than_9", "per_9_to_12", "per_hsd",
+        "per_some_clg", "per_assoc", "per_bchlr", "per_prfsnl",
+    ]
+    money_cols = ["medn_hshld_incm_amt", "medn_incm_per_prsn_amt", "hous_val_amt"]
+
+    # 1) Logs para escalas assimétricas (população, rendas, valor de imóvel)
+    for c in qty_cols + money_cols:
+        if c in out.columns:
+            out[f"{c}_log"] = _safe_log1p(out[c])
+
+    # 2) Percentuais como frações 0–1 + clamp
+    for c in per_cols:
+        if c in out.columns:
+            out[f"{c}_frac"] = _as_fraction(out[c])
+
+    # 3) Razões renda <-> valor de imóvel
+    if "hous_val_amt" in out.columns and "medn_hshld_incm_amt" in out.columns:
+        out["house_value_to_income"] = out["hous_val_amt"] / (out["medn_hshld_incm_amt"] + 1.0)
+        out["income_to_house_value"] = out["medn_hshld_incm_amt"] / (out["hous_val_amt"] + 1.0)
+
+    # 4) Índices de escolaridade
+    #    - participação de ensino superior (bachelor + professional)
+    high_edu_parts = []
+    for c in ["per_bchlr", "per_prfsnl"]:
+        if c in out.columns:
+            high_edu_parts.append(f"{c}_frac")
+            if f"{c}_frac" not in out.columns:  # garante existência se ainda não criado
+                out[f"{c}_frac"] = _as_fraction(out[c])
+    if high_edu_parts:
+        out["share_high_edu"] = out[high_edu_parts].sum(axis=1).clip(0.0, 1.0)
+
+    #    - entropia da distribuição de escolaridade (usando as quantidades se existirem)
+    edu_qty_present = [c for c in qty_cols if c.startswith("edctn_") and c in out.columns]
+    if edu_qty_present:
+        out["edu_entropy"] = _entropy_from_parts(out[edu_qty_present])
+
+    # 5) Urbanização
+    #    - diferença entre urbano e rural (faz sentido como sinal de acesso/infra)
+    if "per_urbn" in out.columns:
+        if "per_farm" in out.columns:
+            out["urbanization_idx"] = _as_fraction(out["per_urbn"]) - _as_fraction(out["per_farm"])
+        else:
+            out["urbanization_idx"] = _as_fraction(out["per_urbn"])
+    elif "urbn_ppltn_qty" in out.columns and "ppltn_qty" in out.columns:
+        out["urbanization_idx"] = (out["urbn_ppltn_qty"] / (out["ppltn_qty"] + 1.0)).clip(0.0, 1.0)
+
+    # 6) Non-farm share se existir apenas como quantidade
+    if "non_farm_qty" in out.columns and "ppltn_qty" in out.columns and "per_non_farm_frac" not in out.columns:
+        out["per_non_farm_frac"] = (out["non_farm_qty"] / (out["ppltn_qty"] + 1.0)).clip(0.0, 1.0)
+
+    return out
+
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature engineering seguro, sem vazamento de alvo.
+    Inclui engenharia dos atributos 'structural' da casa e dos demográficos.
+    """
+    out = df.copy()
+
+    # ---------- 1) Casa: combinações e razões simples ----------
     out["rooms"] = out["bedrooms"] + out["bathrooms"]
     bed_nonzero = out["bedrooms"].replace(0, np.nan)
     out["baths_per_bed"] = (out["bathrooms"] / bed_nonzero).fillna(out["bathrooms"])
     out["bed_bath_x"] = out["bedrooms"] * out["bathrooms"]
     out["lot_coverage"] = (out["sqft_living"] / (out["sqft_lot"] + 1.0)).clip(0, 1.0)
+
+    # ---------- 2) Estrutura acima/baixo ----------
     out["is_basement"] = (out["sqft_basement"] > 0).astype(int)
     out["basement_ratio"] = out["sqft_basement"] / (out["sqft_living"] + 1.0)
     out["above_ratio"] = out["sqft_above"] / (out["sqft_living"] + 1.0)
+
+    # ---------- 3) Logs para escalas tendenciosas ----------
     out["sqft_living_log"] = np.log1p(out["sqft_living"])
     out["sqft_lot_log"] = np.log1p(out["sqft_lot"])
+
+    # ---------- 4) Não linearidades leves ----------
     out["bathrooms_sq"] = out["bathrooms"] ** 2
     out["floors_sq"] = out["floors"] ** 2
-    for col in ["median_income", "population", "pop_density", "median_age", "household_size"]:
-        if col in out.columns:
-            out[f"{col}_log"] = np.log1p(out[col])
+
+    # ---------- 5) Demografia (engenharia dedicada) ----------
+    out = add_demo_features(out)
+
     return out
 
 
