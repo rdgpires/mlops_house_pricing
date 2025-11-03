@@ -16,8 +16,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ---------------- Config ----------------
-ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "models/experiments_xgb_optuna/artifacts"))
-DEMOGRAPHICS_CSV = Path(os.getenv("DEMOGRAPHICS_CSV", "data/zipcode_demographics.csv"))
+ARTIFACTS_DIR = "models/experiments_xgb_optuna/artifacts"
+DEMOGRAPHICS_CSV = "data/zipcode_demographics.csv"
 LOG_TARGET = True  # model trained on log1p(price) -> expm1 at inference
 
 
@@ -122,14 +122,14 @@ def _load_bundle(art_dir: Path, stamp: str | None = None) -> tuple[object, list[
 
 
 def _safe_log1p(s: pd.Series) -> pd.Series:
-    # evita negativos/NaN; funciona mesmo com valores faltantes
+    # avoid negatives/NaN; works with missing values as well
     return np.log1p(s.clip(lower=0).fillna(0.0))
 
 
 def _as_fraction(s: pd.Series) -> pd.Series:
-    """Converte percentuais em frações 0–1; assume que valores podem estar em 0–100 ou 0–1; faz clamp."""
+    """Converts percentages into fractions (numbers between o and 1)."""
     s = s.astype(float)
-    # heurística: se a mediana > 1.5, provavelmente está em porcentagem 0–100
+    # heuristics: if median > 1.5, it is probably a percentage
     median = s.replace([np.inf, -np.inf], np.nan).dropna().median() if len(s) else 0
     if pd.notna(median) and median > 1.5:
         s = s / 100.0
@@ -137,27 +137,26 @@ def _as_fraction(s: pd.Series) -> pd.Series:
 
 
 def _entropy_from_parts(parts: pd.DataFrame) -> pd.Series:
-    """Entropia normalizada (0–1) de distribuição de escolaridade."""
+    """Normalized entropy."""
     vals = parts.fillna(0.0).astype(float)
     total = vals.sum(axis=1)
-    # evita divisão por zero
+    # avoids division by zero
     frac = vals.div(total.replace(0, np.nan), axis=0).fillna(0.0)
-    # entropia de Shannon
+    # Shannon entropy
     with np.errstate(divide="ignore", invalid="ignore"):
         ent = -(frac * np.log(frac.where(frac > 0, 1.0))).sum(axis=1)
-    # normaliza por log(k) com k = número de categorias
+    # normalizes by log of the number of categories
     k = vals.shape[1] if vals.shape[1] > 0 else 1
     ent_norm = ent / np.log(k)
     return ent_norm.clip(lower=0.0, upper=1.0).fillna(0.0)
 
 def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Feature engineering para variáveis demográficas do arquivo anexado.
-    Opera defensivamente: só cria o que existir nas colunas.
+    Feature engineering for demographic variables.
     """
     out = df.copy()
 
-    # Nomes esperados (do CSV anexado)
+    # Quantity columns
     qty_cols = [
         "ppltn_qty", "urbn_ppltn_qty", "sbrbn_ppltn_qty", "farm_ppltn_qty",
         "non_farm_qty",
@@ -165,6 +164,7 @@ def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
         "edctn_some_clg_qty", "edctn_assoc_dgre_qty",
         "edctn_bchlr_dgre_qty", "edctn_prfsnl_qty",
     ]
+    # Percentage columns
     per_cols = [
         "per_urbn", "per_sbrbn", "per_farm", "per_non_farm",
         "per_less_than_9", "per_9_to_12", "per_hsd",
@@ -172,39 +172,36 @@ def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
     ]
     money_cols = ["medn_hshld_incm_amt", "medn_incm_per_prsn_amt", "hous_val_amt"]
 
-    # 1) Logs para escalas assimétricas (população, rendas, valor de imóvel)
+    # 1) Logs for assymetric columns
     for c in qty_cols + money_cols:
         if c in out.columns:
             out[f"{c}_log"] = _safe_log1p(out[c])
 
-    # 2) Percentuais como frações 0–1 + clamp
+    # 2) Apply fractions to percentage columns
     for c in per_cols:
         if c in out.columns:
             out[f"{c}_frac"] = _as_fraction(out[c])
 
-    # 3) Razões renda <-> valor de imóvel
+    # 3) Ratio house sales price and income
     if "hous_val_amt" in out.columns and "medn_hshld_incm_amt" in out.columns:
         out["house_value_to_income"] = out["hous_val_amt"] / (out["medn_hshld_incm_amt"] + 1.0)
         out["income_to_house_value"] = out["medn_hshld_incm_amt"] / (out["hous_val_amt"] + 1.0)
 
-    # 4) Índices de escolaridade
-    #    - participação de ensino superior (bachelor + professional)
+    # 4) Apply normalized entropy into superior education
     high_edu_parts = []
     for c in ["per_bchlr", "per_prfsnl"]:
         if c in out.columns:
             high_edu_parts.append(f"{c}_frac")
-            if f"{c}_frac" not in out.columns:  # garante existência se ainda não criado
+            if f"{c}_frac" not in out.columns:
                 out[f"{c}_frac"] = _as_fraction(out[c])
     if high_edu_parts:
         out["share_high_edu"] = out[high_edu_parts].sum(axis=1).clip(0.0, 1.0)
 
-    #    - entropia da distribuição de escolaridade (usando as quantidades se existirem)
     edu_qty_present = [c for c in qty_cols if c.startswith("edctn_") and c in out.columns]
     if edu_qty_present:
         out["edu_entropy"] = _entropy_from_parts(out[edu_qty_present])
 
-    # 5) Urbanização
-    #    - diferença entre urbano e rural (faz sentido como sinal de acesso/infra)
+    # 5) Urbanization treatment
     if "per_urbn" in out.columns:
         if "per_farm" in out.columns:
             out["urbanization_idx"] = _as_fraction(out["per_urbn"]) - _as_fraction(out["per_farm"])
@@ -213,7 +210,7 @@ def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
     elif "urbn_ppltn_qty" in out.columns and "ppltn_qty" in out.columns:
         out["urbanization_idx"] = (out["urbn_ppltn_qty"] / (out["ppltn_qty"] + 1.0)).clip(0.0, 1.0)
 
-    # 6) Non-farm share se existir apenas como quantidade
+    # 6) Non-farm share as a quantity
     if "non_farm_qty" in out.columns and "ppltn_qty" in out.columns and "per_non_farm_frac" not in out.columns:
         out["per_non_farm_frac"] = (out["non_farm_qty"] / (out["ppltn_qty"] + 1.0)).clip(0.0, 1.0)
 
@@ -222,32 +219,31 @@ def add_demo_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Feature engineering seguro, sem vazamento de alvo.
-    Inclui engenharia dos atributos 'structural' da casa e dos demográficos.
+    Apply Feature engineering
     """
     out = df.copy()
 
-    # ---------- 1) Casa: combinações e razões simples ----------
+    # ---------- 1) Simple combinations and ratios ----------
     out["rooms"] = out["bedrooms"] + out["bathrooms"]
     bed_nonzero = out["bedrooms"].replace(0, np.nan)
     out["baths_per_bed"] = (out["bathrooms"] / bed_nonzero).fillna(out["bathrooms"])
     out["bed_bath_x"] = out["bedrooms"] * out["bathrooms"]
     out["lot_coverage"] = (out["sqft_living"] / (out["sqft_lot"] + 1.0)).clip(0, 1.0)
 
-    # ---------- 2) Estrutura acima/baixo ----------
+    # ---------- 2) Structure ----------
     out["is_basement"] = (out["sqft_basement"] > 0).astype(int)
     out["basement_ratio"] = out["sqft_basement"] / (out["sqft_living"] + 1.0)
     out["above_ratio"] = out["sqft_above"] / (out["sqft_living"] + 1.0)
 
-    # ---------- 3) Logs para escalas tendenciosas ----------
+    # ---------- 3) Logs for assymetric values  ----------
     out["sqft_living_log"] = np.log1p(out["sqft_living"])
     out["sqft_lot_log"] = np.log1p(out["sqft_lot"])
 
-    # ---------- 4) Não linearidades leves ----------
+    # ---------- 4) Add non linearity ----------
     out["bathrooms_sq"] = out["bathrooms"] ** 2
     out["floors_sq"] = out["floors"] ** 2
 
-    # ---------- 5) Demografia (engenharia dedicada) ----------
+    # ---------- 5) Apply demography feature engieneering ----------
     out = add_demo_features(out)
 
     return out
@@ -297,7 +293,7 @@ def _compute_metrics(y_true, y_pred):
 def health_check():
     try:
         mdl, feats, st, mpath, fpath = _load_bundle(ARTIFACTS_DIR)
-        _ = app.state.demographics  # ensure loaded
+        _ = app.state.demographics
     except HTTPException as e:
         return {"status": "degraded", "detail": e.detail}
     except Exception as e:
