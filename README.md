@@ -11,7 +11,9 @@ This repository deploys **two REST APIs** to predict house prices in Seattle usi
 * **Two FastAPI apps**:
 
   * `model_inference.py` (Baseline, **port 8000**): `/predict`, `/predict_basic`, `/evaluate_basic`, `/health_check`. Loads **latest** model on each request to allow **hot-swap** updates without restarting.   
-  * `model_inference_xgb.py` (XGB, **port 8001**): `/predict_one`, `/predict_batch`, `/health_check`. Finds the newest **artifact stamp** so you can drop new artifacts and serve them immediately.  
+  * `model_inference_xgb.py` (XGB, **port 8001**): `/predict_one`, `/predict_batch`, `/health_check`. Finds the newest **artifact stamp** so you can drop new artifacts and serve them immediately.
+* **Test Script**:
+  * `test_api.py` Simple script to show that the application works.
 
 ---
 
@@ -29,19 +31,17 @@ This repository deploys **two REST APIs** to predict house prices in Seattle usi
    * `/predict_basic` accepts only the subset the basic model uses (e.g., bedrooms, bathrooms, sqft, floors, zipcode). Demographics are still joined on the server; missing expected columns are safely handled. 
 4. **Test script / simple demonstration.**
 
-   * The APIs accept batches (or one item, in the XGB app). Using rows from `data/future_unseen_examples.csv` satisfies the test requirement. (Example curl below.) 
+   * The APIs accept batches (or one item, in the XGB app). Using rows from `data/future_unseen_examples.csv` satisfies the test requirement. It can be tested by running the `test_api.py` python script.
 5. **Evaluate model performance.**
 
    * `create_model_cv.py` runs 5-fold CV and persists **RMSE/MAE/R²** means/std per fold. A manifest is stored with model metadata.  
    * The XGB track writes a **report** with best params, CV summary, and final estimators. 
 
-> The above items map directly to the “Deliverables/Requirements” section in the assignment README (inputs, backend demographics join, scaling, hot model updates, minimal-feature endpoint, test script, and evaluation). 
-
 ---
 
 ## 3) Training the models (local)
 
-> Optional if you rely on the container’s entrypoint; it can detect artifacts and skip retraining.
+> Optional if you rely on the container’s entrypoint; it can detect artifacts and skip retraining. Importnat to remmeber: if no model artifacts exist in the `models` directory, the initialization of the container will train a kNN model and a XGB model.
 
 * **Create baseline CV artifacts** (versioned `vN` under `models/house-price/`):
 
