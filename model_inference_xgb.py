@@ -16,8 +16,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ---------------- Config ----------------
-ARTIFACTS_DIR = "models/experiments_xgb_optuna/artifacts"
-DEMOGRAPHICS_CSV = "data/zipcode_demographics.csv"
+ARTIFACTS_DIR = Path("models/experiments_xgb_optuna/artifacts")
+DEMOGRAPHICS_CSV = Path("data/zipcode_demographics.csv")
 LOG_TARGET = True  # model trained on log1p(price) -> expm1 at inference
 
 
